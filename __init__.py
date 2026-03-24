@@ -1,0 +1,1 @@
+"""LegiX — Intelligence réglementaire active."""

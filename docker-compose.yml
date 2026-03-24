@@ -1,0 +1,73 @@
+version: "3.9"
+
+services:
+  # --- PostgreSQL + pgvector ---
+  db:
+    image: pgvector/pgvector:pg16
+    container_name: legix-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: legix
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-legix_dev_password}
+      POSTGRES_DB: legix
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./scripts/init_postgres.sql:/docker-entrypoint-initdb.d/01-init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U legix"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- Backend FastAPI ---
+  api:
+    build: .
+    container_name: legix-api
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${API_PORT:-8000}:8000"
+    environment:
+      # DB PostgreSQL
+      DATABASE_URL: postgresql+asyncpg://legix:${POSTGRES_PASSWORD:-legix_dev_password}@db:5432/legix
+      # IA
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ENRICHMENT_MODEL: ${ENRICHMENT_MODEL:-claude-haiku-4-5-20251001}
+      # Auth
+      JWT_SECRET: ${JWT_SECRET:-legix-change-this-in-prod}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-72}
+      # Telegram
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      # Email
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-legix@example.com}
+      # JORF / PISTE
+      PISTE_CLIENT_ID: ${PISTE_CLIENT_ID:-}
+      PISTE_CLIENT_SECRET: ${PISTE_CLIENT_SECRET:-}
+      # Embeddings
+      VOYAGE_API_KEY: ${VOYAGE_API_KEY:-}
+      # LangSmith
+      LANGCHAIN_TRACING_V2: ${LANGCHAIN_TRACING_V2:-true}
+      LANGCHAIN_API_KEY: ${LANGCHAIN_API_KEY:-}
+      LANGCHAIN_PROJECT: legix
+      # Frontend
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:3006}
+      DASHBOARD_URL: ${DASHBOARD_URL:-http://localhost:3000}
+    volumes:
+      - uploads:/app/data/uploads
+    command: >
+      uvicorn legix.api.app:app
+      --host 0.0.0.0
+      --port 8000
+      --workers ${API_WORKERS:-1}
+
+volumes:
+  pgdata:
+  uploads:

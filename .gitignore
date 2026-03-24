@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Environment
+.env
+!.env.example
+
+# Data
+data/*.db
+data/uploads/*
+!data/.gitkeep
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Node / Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Cache
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# LangGraph
+.langgraph_api/
