@@ -1,16 +1,20 @@
 """Collecteur Scrutins — votes nominatifs de l'Assemblée nationale.
 
-Source : Open data AN — fichiers XML des scrutins publics.
+Source : Open data AN — archive ZIP de fichiers JSON individuels par scrutin.
 Chaque scrutin contient le vote nominatif de chaque député.
 
-URL : https://data.assemblee-nationale.fr/travaux-parlementaires/votes
+URL : https://data.assemblee-nationale.fr/static/openData/repository/17/loi/scrutins/Scrutins.json.zip
 """
 
+import io
 import json
 import logging
+import tempfile
+import zipfile
 from datetime import datetime
+from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from legix.collectors.base import BaseCollector
@@ -18,10 +22,11 @@ from legix.core.models import ScrutinVote
 
 logger = logging.getLogger(__name__)
 
-# API JSON des scrutins (plus simple que le XML complet)
-SCRUTINS_API = "https://www2.assemblee-nationale.fr/scrutins/liste/(legislature)/17/(type)/tous/(idDossier)/tous"
-# Open data direct
-SCRUTINS_JSON_URL = "https://www.assemblee-nationale.fr/dyn/opendata/SCRUTINS.json"
+# Archive ZIP des scrutins (fichiers JSON individuels)
+SCRUTINS_ZIP_URL = (
+    "https://data.assemblee-nationale.fr/static/openData/repository"
+    "/17/loi/scrutins/Scrutins.json.zip"
+)
 
 
 class ScrutinsCollector(BaseCollector):
@@ -33,42 +38,104 @@ class ScrutinsCollector(BaseCollector):
     async def collect(self, db: AsyncSession) -> dict:
         stats = self._empty_stats()
 
-        # Tenter l'API JSON des scrutins
+        # Determiner les scrutins deja en base pour ne pas tout re-traiter
+        result = await db.execute(
+            select(func.count(func.distinct(ScrutinVote.scrutin_numero)))
+        )
+        known_count = result.scalar() or 0
+
         try:
-            data = await self._fetch_json(SCRUTINS_JSON_URL)
-            if data and isinstance(data, dict):
-                scrutins = data.get("scrutins", {}).get("scrutin", [])
-                if isinstance(scrutins, dict):
-                    scrutins = [scrutins]
+            zip_bytes = await self._download_zip()
+            if not zip_bytes:
+                logger.warning("[scrutins] Impossible de telecharger le ZIP")
+                stats["errors"] += 1
+                return stats
 
-                for scrutin in scrutins[-50:]:  # 50 derniers scrutins
-                    await self._process_scrutin(db, stats, scrutin)
+            scrutins = self._extract_scrutins(zip_bytes)
+            logger.info(
+                "[scrutins] %d scrutins dans le ZIP, %d deja en base",
+                len(scrutins), known_count,
+            )
 
-                await db.commit()
+            # Traiter tous les scrutins (le check de doublon est dans _process_scrutin)
+            batch_size = 0
+            for scrutin_data in scrutins:
+                created = await self._process_scrutin(db, stats, scrutin_data)
+                if created:
+                    batch_size += 1
+                # Commit par batch de 50 scrutins pour eviter les transactions trop longues
+                if batch_size >= 50:
+                    await db.commit()
+                    batch_size = 0
+
+            await db.commit()
+
         except Exception as e:
-            logger.warning("[scrutins] Collecte échouée: %s", e)
+            logger.error("[scrutins] Collecte echouee: %s", e, exc_info=True)
             stats["errors"] += 1
 
         if stats["new"] > 0:
-            logger.info("[scrutins] %d nouveaux votes collectés", stats["new"])
+            logger.info("[scrutins] %d nouveaux votes collectes", stats["new"])
         return stats
 
-    async def _process_scrutin(self, db: AsyncSession, stats: dict, scrutin: dict):
-        """Traite un scrutin et extrait les votes nominatifs."""
+    async def _download_zip(self) -> bytes | None:
+        """Telecharge le ZIP des scrutins (timeout etendu car ~19 MB)."""
+        client = await self._get_client()
+        try:
+            resp = await client.get(SCRUTINS_ZIP_URL, timeout=120.0)
+            resp.raise_for_status()
+            logger.info(
+                "[scrutins] ZIP telecharge: %.1f MB",
+                len(resp.content) / 1_000_000,
+            )
+            return resp.content
+        except Exception as e:
+            logger.warning("[scrutins] Erreur telechargement ZIP: %s", e)
+            return None
+
+    def _extract_scrutins(self, zip_bytes: bytes) -> list[dict]:
+        """Extrait les scrutins du ZIP en memoire."""
+        scrutins = []
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    with zf.open(name) as f:
+                        data = json.load(f)
+                    # Le JSON contient {"scrutin": {...}}
+                    scrutin = data.get("scrutin", data)
+                    scrutins.append(scrutin)
+                except (json.JSONDecodeError, KeyError) as e:
+                    logger.debug("[scrutins] Erreur parsing %s: %s", name, e)
+                    continue
+        return scrutins
+
+    async def _process_scrutin(
+        self, db: AsyncSession, stats: dict, scrutin: dict
+    ) -> bool:
+        """Traite un scrutin et extrait les votes nominatifs.
+
+        Returns True si de nouveaux votes ont ete crees.
+        """
         numero = scrutin.get("numero")
         if not numero:
-            return
+            return False
 
         numero_int = int(numero) if isinstance(numero, str) else numero
 
-        # Vérifier si déjà traité
+        # Verifier si deja traite
         existing = await db.execute(
-            select(ScrutinVote).where(ScrutinVote.scrutin_numero == numero_int).limit(1)
+            select(ScrutinVote).where(
+                ScrutinVote.scrutin_numero == numero_int
+            ).limit(1)
         )
         if existing.scalar_one_or_none():
-            return
+            return False
 
-        titre = scrutin.get("titre", scrutin.get("objet", {}).get("libelle", ""))
+        titre = scrutin.get("titre", "")
+        if not titre:
+            titre = scrutin.get("objet", {}).get("libelle", "")
         date_str = scrutin.get("dateScrutin", "")
         scrutin_date = None
         if date_str:
@@ -77,27 +144,41 @@ class ScrutinsCollector(BaseCollector):
             except ValueError:
                 pass
 
-        scrutin_type = scrutin.get("typeVote", {}).get("libelleTypeVote", "ordinaire")
+        scrutin_type = scrutin.get("typeVote", {}).get(
+            "libelleTypeVote", "ordinaire"
+        )
 
-        # Résultats globaux
+        # Resultats globaux
         synthese = scrutin.get("syntheseVote", {})
         nombre_votants = _to_int(synthese.get("nombreVotants"))
-        pour_total = _to_int(synthese.get("nbresSuffExprimesGroupe", {}).get("pour") if isinstance(synthese.get("nbresSuffExprimesGroupe"), dict) else synthese.get("decompte", {}).get("pour"))
-        contre_total = _to_int(synthese.get("decompte", {}).get("contre"))
-        abstentions_total = _to_int(synthese.get("decompte", {}).get("abstentions"))
+        decompte = synthese.get("decompte", {})
+        pour_total = _to_int(decompte.get("pour"))
+        contre_total = _to_int(decompte.get("contre"))
+        abstentions_total = _to_int(decompte.get("abstentions"))
 
-        # Résultat
+        # Resultat
         sort_code = scrutin.get("sort", {}).get("code", "")
-        resultat = "adopte" if sort_code == "adopté" or sort_code == "adopte" else "rejete"
+        resultat = (
+            "adopte"
+            if sort_code in ("adopté", "adopte")
+            else "rejete"
+        )
 
         # Extraire les votes par groupe
-        ventilation = scrutin.get("ventilationVotes", {}).get("organe", {}).get("groupes", {}).get("groupe", [])
+        ventilation = (
+            scrutin.get("ventilationVotes", {})
+            .get("organe", {})
+            .get("groupes", {})
+            .get("groupe", [])
+        )
         if isinstance(ventilation, dict):
             ventilation = [ventilation]
 
+        created_any = False
         for groupe_data in ventilation:
             groupe_ref = groupe_data.get("organeRef", "")
-            decompte = groupe_data.get("vote", {}).get("decompteNominatif", {})
+            vote_data = groupe_data.get("vote", {})
+            decompte_nom = vote_data.get("decompteNominatif", {})
 
             for position_key, position_label in [
                 ("pours", "pour"),
@@ -105,11 +186,14 @@ class ScrutinsCollector(BaseCollector):
                 ("abstentions", "abstention"),
                 ("nonVotants", "non_votant"),
             ]:
-                votants = decompte.get(position_key, {}).get("votant", [])
-                if isinstance(votants, dict):
-                    votants = [votants]
+                votants = decompte_nom.get(position_key, {})
+                if not votants or not isinstance(votants, dict):
+                    continue
+                votant_list = votants.get("votant", [])
+                if isinstance(votant_list, dict):
+                    votant_list = [votant_list]
 
-                for votant in votants:
+                for votant in votant_list:
                     acteur_uid = votant.get("acteurRef", "")
                     if not acteur_uid:
                         continue
@@ -134,12 +218,15 @@ class ScrutinsCollector(BaseCollector):
                     stats["new_uids"]["scrutin_vote"].append(
                         f"{numero_int}-{acteur_uid}"
                     )
+                    created_any = True
 
-        stats["by_type"]["scrutin"] += 1
+        if created_any:
+            stats["by_type"]["scrutin"] += 1
+        return created_any
 
 
 def _to_int(val) -> int | None:
-    """Conversion sûre en int."""
+    """Conversion sure en int."""
     if val is None:
         return None
     try:

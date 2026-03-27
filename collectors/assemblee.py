@@ -274,3 +274,48 @@ class AssembleeCollector(BaseCollector):
                 Path(filepath).unlink(missing_ok=True)
 
         return stats
+
+    async def backfill(self, session: AsyncSession, days: int = 30) -> dict:
+        """Rattrapage historique : collecte les publications des N derniers jours.
+
+        L'AN expose publication_j, publication_j-1, ..., publication_j-N.
+        Cette methode itere sur chaque jour pour ingerer les textes,
+        amendements et reunions manquants.
+        """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        total_stats = {
+            "new": 0, "updated": 0, "skipped": 0, "errors": 0,
+            "by_type": defaultdict(int),
+            "new_uids": {"texte": [], "amendement": [], "reunion": [], "compte_rendu": []},
+            "updated_uids": {"texte": [], "amendement": [], "reunion": [], "compte_rendu": []},
+        }
+
+        for offset in range(days + 1):
+            date_key = "j" if offset == 0 else f"j-{offset}"
+            logger.info("[assemblee] Backfill jour %s...", date_key)
+
+            try:
+                day_stats = await self.collect(session, date=date_key)
+            except Exception as e:
+                logger.warning("[assemblee] Backfill %s echoue: %s", date_key, e)
+                total_stats["errors"] += 1
+                continue
+
+            total_stats["new"] += day_stats["new"]
+            total_stats["updated"] += day_stats["updated"]
+            total_stats["skipped"] += day_stats["skipped"]
+            total_stats["errors"] += day_stats["errors"]
+            for k, v in day_stats["by_type"].items():
+                total_stats["by_type"][k] += v
+            for k in total_stats["new_uids"]:
+                total_stats["new_uids"][k].extend(day_stats["new_uids"].get(k, []))
+            for k in total_stats["updated_uids"]:
+                total_stats["updated_uids"][k].extend(day_stats["updated_uids"].get(k, []))
+
+        logger.info(
+            "[assemblee] Backfill %d jours termine: %d nouveaux, %d maj, %d erreurs",
+            days, total_stats["new"], total_stats["updated"], total_stats["errors"],
+        )
+        return total_stats

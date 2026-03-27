@@ -352,3 +352,58 @@ class SenatCollector(BaseCollector):
             stats["new"], stats["updated"], stats["errors"],
         )
         return stats
+
+    async def backfill(
+        self, db: AsyncSession, session_year: str = "25", max_numero: int = 500
+    ) -> dict:
+        """Rattrapage historique : recupere tous les textes de la session.
+
+        Genere les URLs pour ppl{session_year}-001 a ppl{session_year}-{max_numero}
+        et pjl{session_year}-001 a pjl{session_year}-{max_numero}, puis tente
+        de telecharger et parser chaque texte + ses amendements.
+        """
+        stats = self._empty_stats()
+        base = settings.senat_base_url
+
+        prefixes = ["ppl", "pjl"]
+        for prefix in prefixes:
+            for numero in range(1, max_numero + 1):
+                url = f"{base}/leg/{prefix}{session_year}-{numero}.html"
+
+                # Skip si deja vu
+                if await self._is_seen(db, url):
+                    continue
+
+                html = await self._fetch_text(url)
+                if not html or "404" in html[:200]:
+                    # Marquer comme vu pour ne pas re-tenter
+                    await self._mark_seen(db, url, "not_found", "")
+                    continue
+
+                try:
+                    data = parse_senat_texte(url, html)
+                    result = await self._store_texte(db, data)
+                    self._record_stat(stats, result, "texte", data["uid"])
+                    await self._mark_seen(db, url, "texte", data.get("uid", ""))
+                    logger.info("[senat-backfill] %s: %s (%s)", data["uid"], data.get("titre", "")[:80], result)
+                except Exception as e:
+                    stats["errors"] += 1
+                    logger.debug("[senat-backfill] Erreur %s: %s", url, e)
+                    await self._mark_seen(db, url, "error", "")
+
+                # Commit par batch
+                if (stats["new"] + stats["updated"]) % 20 == 0:
+                    await db.commit()
+
+            await db.commit()
+
+        # Phase 2 : recuperer les amendements pour tous les textes Senat en base
+        logger.info("[senat-backfill] Phase 2: amendements pour textes connus...")
+        await self._collect_amendements_for_textes(db, stats)
+        await db.commit()
+
+        logger.info(
+            "[senat-backfill] Termine: %d nouveaux, %d maj, %d erreurs",
+            stats["new"], stats["updated"], stats["errors"],
+        )
+        return stats

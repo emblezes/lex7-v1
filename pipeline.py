@@ -67,6 +67,8 @@ async def collect_and_process():
             "signals": 0,
             "followups_created": 0,
             "briefs_created": 0,
+            "alerts_created": 0,
+            "orchestrated": 0,
         }
 
         try:
@@ -264,6 +266,7 @@ async def collect_and_process():
             from legix.agents.trigger import (
                 on_new_texte,
                 on_new_amendments_for_texte,
+                generate_alerts_for_new_documents,
             )
 
             # 5a. Nouveaux textes enrichis
@@ -296,6 +299,19 @@ async def collect_and_process():
                         texte_uid, e,
                     )
 
+            # 6. Generer les alertes d'impact et orchestrer (critical/high)
+            all_new_texte_uids = new_uids.get("texte", [])
+            all_new_amdt_uids = new_uids.get("amendement", [])
+            if all_new_texte_uids or all_new_amdt_uids:
+                try:
+                    alert_result = await generate_alerts_for_new_documents(
+                        db, all_new_texte_uids, all_new_amdt_uids,
+                    )
+                    stats["alerts_created"] = alert_result.get("alerts_created", 0)
+                    stats["orchestrated"] = alert_result.get("orchestrated", 0)
+                except Exception as e:
+                    logger.warning("Generation alertes echouee: %s", e)
+
             # Marquer le run comme terminé
             run.status = "completed"
             run.stats = json.dumps(stats)
@@ -304,10 +320,11 @@ async def collect_and_process():
 
             logger.info(
                 "Pipeline terminé: %d collectés, %d enrichis, %d scorés, "
-                "%d signaux, %d followups, %d briefs",
+                "%d signaux, %d followups, %d briefs, %d alertes, %d orchestrées",
                 stats["collected"], stats["enriched"], stats["scored"],
                 stats["signals"], stats["followups_created"],
-                stats["briefs_created"],
+                stats["briefs_created"], stats["alerts_created"],
+                stats["orchestrated"],
             )
 
         except Exception as e:

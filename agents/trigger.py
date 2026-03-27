@@ -2,23 +2,30 @@
 
 Quand un nouveau texte ou amendement enrichi arrive :
 - Si le texte matche les secteurs d'un client → creer un TexteFollowUp + TexteBrief
-- Si un amendement arrive sur un texte deja suivi → marquer le brief comme perime
-- Les alertes individuelles ne sont creees que pour des cas exceptionnels
-  (ex: amendement gouvernemental sur un texte parlementaire)
+- Generer une ImpactAlert pour chaque match pertinent
+- Appeler le CoordinateurAgent pour les alertes critical/high
+- Les alertes individuelles exceptionnelles (ex: amendement gouvernemental)
+  declenchent des notifications instantanees
 """
 
+import asyncio
 import json
 import logging
+import re
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+import anthropic
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from legix.core.config import settings
 from legix.core.models import (
     Amendement,
     ClientProfile,
     Evenement,
+    ImpactAlert,
+    NotificationQueue,
     TexteBrief,
     TexteFollowUp,
     Texte,
@@ -309,3 +316,263 @@ async def on_new_document(
         )
 
     return []  # Plus d'alertes individuelles
+
+
+# --- Generation d'alertes et orchestration ---
+
+
+def _clean_html(text: str | None) -> str:
+    """Nettoie le HTML basique."""
+    if not text:
+        return ""
+    clean = re.sub(r"<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", clean).strip()[:300]
+
+
+def _build_doc_summary(doc: Texte | Amendement) -> str:
+    """Construit un resume compact du document pour le prompt."""
+    parts: list[str] = []
+    if isinstance(doc, Texte):
+        parts.append(f"Type: texte legislatif")
+        parts.append(f"Titre: {doc.titre_court or doc.titre or 'N/A'}")
+        if doc.type_libelle:
+            parts.append(f"Nature: {doc.type_libelle}")
+        if doc.resume_ia:
+            parts.append(f"Resume: {doc.resume_ia[:300]}")
+        if doc.source:
+            parts.append(f"Source: {doc.source}")
+    elif isinstance(doc, Amendement):
+        parts.append(f"Type: amendement")
+        parts.append(f"Numero: {doc.numero or doc.uid}")
+        if doc.auteur_nom:
+            parts.append(f"Auteur: {doc.auteur_nom}")
+        if doc.groupe_nom:
+            parts.append(f"Groupe: {doc.groupe_nom}")
+        if doc.article_vise:
+            parts.append(f"Article vise: {doc.article_vise}")
+        if doc.sort:
+            parts.append(f"Sort: {doc.sort}")
+        if doc.resume_ia:
+            parts.append(f"Resume: {doc.resume_ia[:300]}")
+        elif doc.expose_sommaire:
+            parts.append(f"Expose: {_clean_html(doc.expose_sommaire)[:200]}")
+    themes = parse_themes(doc.themes) if doc.themes else []
+    if themes:
+        parts.append(f"Themes: {', '.join(themes)}")
+    return "\n".join(parts)
+
+
+async def _analyze_impact_for_profile(
+    profile: ClientProfile,
+    documents: list[Texte | Amendement],
+) -> list[dict]:
+    """Appelle Claude pour scorer l'impact de documents sur un profil client.
+
+    Version legere pour le pipeline continu (pas le scan complet d'onboarding).
+    Retourne une liste de dicts {doc_index, impact_level, is_threat, impact_summary, exposure_eur}.
+    """
+    if not settings.anthropic_api_key or not documents:
+        return []
+
+    company = profile.name
+    sectors = ", ".join(json.loads(profile.sectors)) if profile.sectors else ""
+    reg_focus = ", ".join(json.loads(profile.regulatory_focus)) if profile.regulatory_focus else ""
+
+    docs_text = []
+    for i, doc in enumerate(documents):
+        docs_text.append(f"--- Document {i} ---\n{_build_doc_summary(doc)}")
+    docs_block = "\n\n".join(docs_text)
+
+    prompt = f"""Tu es analyste senior en affaires publiques pour {company}.
+Secteurs: {sectors}
+Focus reglementaire: {reg_focus}
+
+Analyse chaque document et evalue son impact pour {company}.
+
+FORMAT JSON strict (pas de texte avant/apres) :
+[
+  {{
+    "doc_index": 0,
+    "impact_level": "critical|high|medium|low",
+    "is_threat": true,
+    "impact_summary": "Resume en 2-3 phrases de l'impact pour {company}",
+    "exposure_eur": 0
+  }}
+]
+
+DOCUMENTS :
+{docs_block}"""
+
+    try:
+        client = anthropic.Anthropic(api_key=settings.anthropic_api_key)
+        response = await asyncio.to_thread(
+            client.messages.create,
+            model=settings.enrichment_model,
+            max_tokens=2048,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        text = response.content[0].text.strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*", "", text)
+            text = re.sub(r"\s*```$", "", text)
+        return json.loads(text)
+    except Exception as e:
+        logger.warning("Analyse impact echouee pour %s: %s", company, e)
+        return []
+
+
+async def generate_alerts_for_new_documents(
+    db: AsyncSession,
+    new_texte_uids: list[str],
+    new_amendement_uids: list[str],
+) -> dict:
+    """Genere des ImpactAlert pour les nouveaux documents et orchestre les alertes critiques.
+
+    C'est le maillon manquant entre le trigger (TexteFollowUp) et le coordinateur (notifications).
+    Appele a la fin du pipeline, apres la creation des followups.
+
+    Returns:
+        {"alerts_created": int, "orchestrated": int}
+    """
+    profiles = await get_active_profiles(db)
+    if not profiles:
+        return {"alerts_created": 0, "orchestrated": 0}
+
+    # Charger les nouveaux documents
+    new_docs: list[Texte | Amendement] = []
+    for uid in new_texte_uids:
+        doc = await db.get(Texte, uid)
+        if doc and doc.themes:
+            new_docs.append(doc)
+    for uid in new_amendement_uids:
+        doc = await db.get(Amendement, uid)
+        if doc and doc.themes:
+            new_docs.append(doc)
+
+    if not new_docs:
+        return {"alerts_created": 0, "orchestrated": 0}
+
+    alerts_created = 0
+    orchestrated = 0
+
+    for profile in profiles:
+        # Filtrer les documents pertinents pour ce profil
+        relevant_docs: list[Texte | Amendement] = []
+        for doc in new_docs:
+            doc_themes = parse_themes(doc.themes)
+            title = None
+            content = None
+            if isinstance(doc, Texte):
+                title = doc.titre or doc.titre_court
+                content = doc.resume_ia
+            elif isinstance(doc, Amendement):
+                title = f"Amendement {doc.numero or doc.uid}"
+                content = doc.resume_ia or _clean_html(doc.expose_sommaire)
+
+            matched = _matching_profiles(
+                doc_themes, [profile],
+                title=title,
+                content=content,
+            )
+            if matched:
+                relevant_docs.append(doc)
+
+        if not relevant_docs:
+            continue
+
+        # Appeler Claude pour scorer l'impact (max 10 docs par appel)
+        analyses = await _analyze_impact_for_profile(
+            profile, relevant_docs[:10]
+        )
+
+        if not analyses:
+            continue
+
+        # Creer les ImpactAlert
+        from legix.agents.coordinateur import CoordinateurAgent
+        coordinateur = CoordinateurAgent()
+
+        for analysis in analyses:
+            idx = analysis.get("doc_index", -1)
+            if idx < 0 or idx >= len(relevant_docs):
+                continue
+
+            doc = relevant_docs[idx]
+            level = analysis.get("impact_level", "medium")
+            if level not in ("critical", "high", "medium", "low"):
+                level = "medium"
+
+            # Verifier qu'on n'a pas deja une alerte pour ce doc/profil
+            existing_query = select(ImpactAlert).where(
+                ImpactAlert.profile_id == profile.id,
+            )
+            if isinstance(doc, Texte):
+                existing_query = existing_query.where(ImpactAlert.texte_uid == doc.uid)
+            else:
+                existing_query = existing_query.where(ImpactAlert.amendement_uid == doc.uid)
+
+            existing = (await db.execute(existing_query)).scalar_one_or_none()
+            if existing:
+                continue
+
+            # Themes matches
+            doc_themes = parse_themes(doc.themes)
+            client_sectors = json.loads(profile.sectors) if profile.sectors else []
+            matched_themes = list(set(doc_themes) & set(client_sectors))
+
+            alert = ImpactAlert(
+                profile_id=profile.id,
+                impact_level=level,
+                impact_summary=analysis.get("impact_summary", ""),
+                exposure_eur=analysis.get("exposure_eur"),
+                matched_themes=json.dumps(matched_themes, ensure_ascii=False),
+                is_threat=analysis.get("is_threat", True),
+                is_read=False,
+            )
+
+            if isinstance(doc, Texte):
+                alert.texte_uid = doc.uid
+            elif isinstance(doc, Amendement):
+                alert.amendement_uid = doc.uid
+                if doc.texte_ref:
+                    alert.texte_uid = doc.texte_ref
+
+            db.add(alert)
+            await db.flush()  # Pour obtenir alert.id
+            alerts_created += 1
+
+            logger.info(
+                "ImpactAlert creee: %s [%s] pour %s (doc: %s)",
+                level, "menace" if alert.is_threat else "opportunite",
+                profile.name, doc.uid if hasattr(doc, 'uid') else "?",
+            )
+
+            # Orchestrer les alertes critical/high via le Coordinateur
+            if level in ("critical", "high"):
+                try:
+                    await coordinateur.orchestrate(db, alert, profile)
+                    orchestrated += 1
+                    logger.info(
+                        "Orchestration %s terminee pour %s — alert #%d",
+                        level, profile.name, alert.id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Orchestration echouee pour alert #%d: %s",
+                        alert.id, e,
+                    )
+
+            # Pour les alertes medium, creer une notification email simple
+            elif level == "medium" and profile.email:
+                db.add(NotificationQueue(
+                    profile_id=profile.id,
+                    channel="email",
+                    priority="normal",
+                    subject=f"[LegiX] Nouveau signal — {profile.name}",
+                    body=(alert.impact_summary or "Nouveau signal detecte")[:500],
+                    alert_id=alert.id,
+                ))
+
+        await db.commit()
+
+    return {"alerts_created": alerts_created, "orchestrated": orchestrated}
